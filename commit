@@ -1,0 +1,346 @@
+//+------------------------------------------------------------------+  
+//|                          Breakout_EA.mq4                         |  
+//|                Copyright 2024, Your Name                         |  
+//|                          https://yourwebsite.com                 |  
+//+------------------------------------------------------------------+  
+#property strict  
+
+// Input parameters  
+input double PercentOfAccount = 1.0;  // Percentage of account balance to use for lot size
+input double TakeProfit = 50;         // Take profit in pips  
+input double StopLoss = 50;           // Initial stop loss in pips  
+input double TrailingStop = 20;       // Trailing stop in pips  
+input int Slippage = 3;               // Slippage in pips  
+input int RSI_Period = 14;            // Period for RSI  
+input double RSI_Overbought = 70;     // Overbought level  
+input double RSI_Oversold = 30;       // Oversold level  
+input int Timeframe = PERIOD_H1;      // Timeframe for the strategy  
+input double ParSAR_Step = 0.02;      // Step for Parabolic SAR  
+input double ParSAR_Maximum = 0.2;    // Maximum for Parabolic SAR  
+input int ATR_Period = 14;            // ATR period  
+input double ATR_StopLossFactor = 1.5;// ATR multiplier for Stop Loss  
+input double ATR_TakeProfitFactor = 3.0;// ATR multiplier for Take Profit  
+input int MaxDailyTrades = 10;        // Maximum trades allowed per day  
+input double TrailingStep = 5;        // Trailing step in pips  
+input int TrendMA_Period = 50;        // Period for trend MA
+input int TrendMA_Method = MODE_SMA;  // Method for trend MA (0=SMA, 1=EMA, 2=SMMA, 3=LWMA)
+input int TrendMA_AppliedPrice = PRICE_CLOSE; // Applied price for trend MA
+input double BreakEvenLevel = 30;     // Break-even level in pips
+input double PartialProfitLevel = 50; // Level to take partial profit in pips
+input double PartialProfitPercentage = 0.5; // Percentage of position to close for partial profit
+input double FixedLotSize = 0.01;     // Fixed lot size
+
+//+------------------------------------------------------------------+  
+//| Expert initialization function                                   |  
+//+------------------------------------------------------------------+  
+int OnInit()  
+{  
+   Print("Breakout EA initialized");  
+   return INIT_SUCCEEDED;  
+}  
+
+//+------------------------------------------------------------------+  
+//| Function to calculate lot size based on account balance          |  
+//+------------------------------------------------------------------+  
+double CalculateLotSize()  
+{  
+    double riskPerTrade = (AccountBalance() * PercentOfAccount / 100.0); // Amount to risk per trade
+    double stopLossInMoney = StopLoss * MarketInfo(Symbol(), MODE_TICKVALUE);
+    double lotSize = riskPerTrade / stopLossInMoney; // Calculate lot size based on the risk per trade
+
+    // Ensure the lot size doesn't exceed the maximum allowed lot size
+    double maxLotSize = MarketInfo(Symbol(), MODE_MAXLOT);
+    if (lotSize > maxLotSize)
+    {
+        lotSize = maxLotSize;
+    }
+
+    // Normalize lot size to the broker's allowed lot step
+    double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
+    lotSize = MathFloor(lotSize / lotStep) * lotStep;
+
+    // Ensure the lot size is not less than the minimum allowed lot size
+    double minLotSize = MarketInfo(Symbol(), MODE_MINLOT);
+    if (lotSize < minLotSize)
+    {
+        lotSize = minLotSize;
+    }
+
+    return lotSize;
+}  
+
+//+------------------------------------------------------------------+  
+//| Function to check if there are existing buy or sell orders       |  
+//+------------------------------------------------------------------+  
+bool HasOpenOrders(string symbol, int orderType)  
+{  
+   for (int i = OrdersTotal() - 1; i >= 0; i--)  
+   {  
+      if (OrderSelect(i, SELECT_BY_POS) && OrderSymbol() == symbol && OrderType() == orderType)  
+      {  
+        return true; // There is an open order  
+      }  
+   }  
+   return false; // No open orders  
+}  
+
+//+------------------------------------------------------------------+  
+//| Function to check entry conditions for buy or sell               |  
+//+------------------------------------------------------------------+  
+bool CheckEntryConditions(string symbol, int orderType)  
+{  
+    double parSAR = iSAR(symbol, Timeframe, ParSAR_Step, ParSAR_Maximum, 0); // Get the Parabolic SAR value  
+    double currentPrice = (orderType == OP_BUY) ? Bid : Ask; // Use Bid price for buy orders and Ask price for sell orders  
+    double maTrend = iMA(symbol, Timeframe, TrendMA_Period, 0, TrendMA_Method, TrendMA_AppliedPrice, 0); // Get the trend MA value
+    double rsi = iRSI(symbol, Timeframe, RSI_Period, PRICE_CLOSE, 0); // Get the RSI value
+
+    // Check if we should buy or sell (SAR is below/above price, confirm with trend MA and RSI)  
+    if(orderType == OP_BUY)
+        return (currentPrice > parSAR && !HasOpenOrders(symbol, OP_BUY) && currentPrice > maTrend && rsi < RSI_Oversold);
+    else if(orderType == OP_SELL)
+        return (currentPrice < parSAR && !HasOpenOrders(symbol, OP_SELL) && currentPrice < maTrend && rsi > RSI_Overbought);
+    return false;
+}  
+
+//+------------------------------------------------------------------+  
+//| Function to reset daily trade count                              |  
+//+------------------------------------------------------------------+  
+void ResetDailyTradeCount(int &dailyTradeCount, datetime &lastTradeTime)  
+{  
+   if (TimeYear(TimeCurrent()) != TimeYear(lastTradeTime) ||  
+      TimeDayOfYear(TimeCurrent()) != TimeDayOfYear(lastTradeTime))  
+   {  
+      dailyTradeCount = 0; // Reset at the start of a new day  
+   }  
+}  
+
+//+------------------------------------------------------------------+  
+//| Function to open a buy or sell order with trade limit checks     |  
+//+------------------------------------------------------------------+  
+void OpenOrderWithLimit(string symbol, int orderType, int &dailyTradeCount, datetime &lastTradeTime)  
+{  
+   ResetDailyTradeCount(dailyTradeCount, lastTradeTime); // Reset daily count if a new day starts  
+
+   if (dailyTradeCount < MaxDailyTrades)  
+   {  
+      double price = (orderType == OP_BUY) ? Ask : Bid; // Current ask price for buy orders and bid price for sell orders  
+      double lotSize = CalculateLotSize(); // Calculate lot size based on account balance
+
+      // Calculate ATR and set stop loss and take profit  
+      double atr = iATR(symbol, Timeframe, ATR_Period, 0); // Get the ATR value  
+      double atrStopLoss = ATR_StopLossFactor * atr; // Calculate stop loss distance  
+      double atrTakeProfit = ATR_TakeProfitFactor * atr; // Calculate take profit distance  
+
+      // Normalize the stop loss and take profit values  
+      double sl = NormalizeDouble((orderType == OP_BUY) ? price - atrStopLoss : price + atrStopLoss, (int)MarketInfo(symbol, MODE_DIGITS)); // Stop loss  
+      double tp = NormalizeDouble((orderType == OP_BUY) ? price + atrTakeProfit : price - atrTakeProfit, (int)MarketInfo(symbol, MODE_DIGITS)); // Take profit  
+
+      // Ensure stop loss and take profit are valid
+      if (sl <= 0 || tp <= 0)
+      {
+         Print("Invalid stop loss or take profit values. SL: ", sl, " TP: ", tp);
+         return;
+      }
+
+      // Check if there are enough funds to place the order
+      if (AccountFreeMarginCheck(symbol, orderType, lotSize) >= MarketInfo(symbol, MODE_MARGINREQUIRED) * lotSize)
+      {
+         // Send a buy or sell order and handle errors  
+         int ticket = OrderSend(symbol, orderType, lotSize, price, Slippage, sl, tp, "Breakout Order", 0, 0, clrGreen);  
+         if (ticket >= 0) // If order is successful  
+         {  
+            dailyTradeCount++; // Increase trade count  
+            lastTradeTime = TimeCurrent(); // Update last trade time  
+            Print("Order opened successfully: ", ticket);  
+            DrawTrailingStopLine(ticket, sl, clrRed); // Draw initial stop loss line
+         }  
+         else  
+         {  
+            int errorCode = GetLastError();
+            Print("Error opening order: ", errorCode);
+            // Handle specific error codes if necessary
+            ResetLastError(); // Optionally reset the error code
+         }  
+      }
+      else
+      {
+         Print("Not enough funds to open order");
+      }
+   }  
+   else  
+   {  
+      Print("Daily trade limit reached. No new trade opened.");  
+   }  
+}  
+
+//+------------------------------------------------------------------+  
+//| Function to draw trailing stop line                              |  
+//+------------------------------------------------------------------+  
+void DrawTrailingStopLine(int ticket, double price, color lineColor)
+{
+    string name = "TrailingStop_" + IntegerToString(ticket);
+    if (ObjectFind(0, name) != 0)
+    {
+        ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+        ObjectSetInteger(0, name, OBJPROP_COLOR, lineColor);
+        ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
+    }
+    else
+    {
+        ObjectSetDouble(0, name, OBJPROP_PRICE1, price);
+    }
+}
+
+//+------------------------------------------------------------------+  
+//| Function to implement trailing stop                              |  
+//+------------------------------------------------------------------+  
+void ManageTrailingStop(string symbol)  
+{  
+   double stopLevel = MarketInfo(symbol, MODE_STOPLEVEL) * Point; // Minimum stop level distance  
+   Print("Stop Level: ", stopLevel);
+   for (int i = OrdersTotal() - 1; i >= 0; i--)  
+   {  
+      if (OrderSelect(i, SELECT_BY_POS) && OrderSymbol() == symbol && (OrderType() == OP_BUY || OrderType() == OP_SELL))  
+      {  
+         double newSL;
+         double trailingStepInPoints = TrailingStep * Point;
+         Print("Order Type: ", OrderType(), " TrailingStep: ", trailingStepInPoints);
+         if (OrderType() == OP_BUY)
+         {
+            newSL = NormalizeDouble(Bid - TrailingStop * Point, (int)MarketInfo(symbol, MODE_DIGITS));  
+            Print("New SL for BUY: ", newSL);
+            if (OrderStopLoss() < newSL && newSL >= (OrderOpenPrice() + stopLevel) && (Bid - OrderStopLoss()) >= trailingStepInPoints)  
+            {  
+               Print("Updating trailing stop for buy order: ", OrderTicket(), " New SL: ", newSL);  
+               if (OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen))  
+               {  
+                  Print("Trailing stop updated for order: ", OrderTicket());  
+                  DrawTrailingStopLine(OrderTicket(), newSL, clrGreen); // Draw trailing stop line  
+               }  
+               else  
+               {  
+                  int errorCode = GetLastError();
+                  Print("Error modifying order: ", errorCode);
+                  // Handle specific error codes if necessary
+                  ResetLastError(); // Optionally reset the error code
+               }  
+            }  
+         }
+         else if (OrderType() == OP_SELL)
+         {
+            newSL = NormalizeDouble(Ask + TrailingStop * Point, (int)MarketInfo(symbol, MODE_DIGITS));  
+            Print("New SL for SELL: ", newSL);
+            if (OrderStopLoss() > newSL && newSL <= (OrderOpenPrice() - stopLevel) && (OrderStopLoss() - Ask) >= trailingStepInPoints)  
+            {  
+               Print("Updating trailing stop for sell order: ", OrderTicket(), " New SL: ", newSL);  
+               if (OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen))  
+               {  
+                  Print("Trailing stop updated for order: ", OrderTicket());  
+                  DrawTrailingStopLine(OrderTicket(), newSL, clrRed); // Draw trailing stop line  
+               }  
+               else  
+               {  
+                  int errorCode = GetLastError();
+                  Print("Error modifying order: ", errorCode);
+                  // Handle specific error codes if necessary
+                  ResetLastError(); // Optionally reset the error code
+               }  
+            }  
+         }
+      }  
+   }  
+}
+
+//+------------------------------------------------------------------+  
+//| Function to implement break-even stop                            |  
+//+------------------------------------------------------------------+  
+void ManageBreakEvenStop(string symbol)  
+{  
+   for (int i = OrdersTotal() - 1; i >= 0; i--)  
+   {  
+      if (OrderSelect(i, SELECT_BY_POS) && OrderSymbol() == symbol && (OrderType() == OP_BUY || OrderType() == OP_SELL))  
+      {  
+        double breakEvenPrice = (OrderType() == OP_BUY) ? OrderOpenPrice() + BreakEvenLevel * Point : OrderOpenPrice() - BreakEvenLevel * Point;  
+        if ((OrderType() == OP_BUY && Bid >= breakEvenPrice) || (OrderType() == OP_SELL && Ask <= breakEvenPrice))  
+        {  
+            double newSL = (OrderType() == OP_BUY) ? OrderOpenPrice() : OrderOpenPrice();  
+            if (OrderStopLoss() < newSL)  
+            {  
+                Print("Setting break-even stop for order: ", OrderTicket(), " New SL: ", newSL);  
+                if (OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen))  
+                {  
+                    Print("Break-even stop set for order: ", OrderTicket());  
+                    DrawTrailingStopLine(OrderTicket(), newSL, clrGreen); // Draw break-even stop line  
+                }  
+                else  
+                {  
+                    int errorCode = GetLastError();
+                    Print("Error modifying order: ", errorCode);
+                    // Handle specific error codes if necessary
+                    ResetLastError(); // Optionally reset the error code
+                }  
+            }  
+        }  
+      }  
+   }  
+}
+
+//+------------------------------------------------------------------+  
+//| Function to implement partial profit taking                      |  
+//+------------------------------------------------------------------+  
+void ManagePartialProfitTaking(string symbol)  
+{  
+   for (int i = OrdersTotal() - 1; i >= 0; i--)  
+   {  
+      if (OrderSelect(i, SELECT_BY_POS) && OrderSymbol() == symbol && (OrderType() == OP_BUY || OrderType() == OP_SELL))  
+      {  
+        double partialProfitPrice = (OrderType() == OP_BUY) ? OrderOpenPrice() + PartialProfitLevel * Point : OrderOpenPrice() - PartialProfitLevel * Point;  
+        if ((OrderType() == OP_BUY && Bid >= partialProfitPrice) || (OrderType() == OP_SELL && Ask <= partialProfitPrice))  
+        {  
+            double closeLots = OrderLots() * PartialProfitPercentage;  
+            if (OrderClose(OrderTicket(), closeLots, (OrderType() == OP_BUY) ? Bid : Ask, Slippage, clrGreen))  
+            {  
+                Print("Partial profit taken for order: ", OrderTicket(), " Lots closed: ", closeLots);  
+            }  
+            else  
+            {  
+                int errorCode = GetLastError();
+                Print("Error closing partial profit: ", errorCode);
+                // Handle specific error codes if necessary
+                ResetLastError(); // Optionally reset the error code
+            }  
+        }  
+      }  
+   }  
+}
+
+//+------------------------------------------------------------------+  
+//| Expert tick function                                             |  
+//+------------------------------------------------------------------+  
+void OnTick()  
+{  
+   string symbol = Symbol(); // Get the symbol for the current chart  
+   static int dailyTradeCount = 0; // Static variable to count trades for the day  
+   static datetime lastTradeTime = 0; // Static variable to track the last trade time  
+   
+   // Limit the frequency of checks to avoid freezing
+   static datetime lastCheckTime = 0;
+   if (TimeCurrent() - lastCheckTime >= 60) // Check every minute
+   {
+      lastCheckTime = TimeCurrent();
+
+      // Check entry conditions and open a buy or sell order if no existing orders  
+      if (CheckEntryConditions(symbol, OP_BUY))  
+      {  
+         OpenOrderWithLimit(symbol, OP_BUY, dailyTradeCount, lastTradeTime);  
+      }  
+      else if (CheckEntryConditions(symbol, OP_SELL))  
+      {  
+         OpenOrderWithLimit(symbol, OP_SELL, dailyTradeCount, lastTradeTime);  
+      }  
+      ManageTrailingStop(symbol); // Manage trailing stops for open orders  
+      ManageBreakEvenStop(symbol); // Manage break-even stops for open orders
+      ManagePartialProfitTaking(symbol); // Manage partial profit taking for open orders
+   }
+}  
+//+------------------------------------------------------------------+
